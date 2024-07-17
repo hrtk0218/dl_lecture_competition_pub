@@ -10,6 +10,8 @@ import torch
 import torch.nn as nn
 import torchvision
 from torchvision import transforms
+from torch.optim.lr_scheduler import StepLR
+from transformers import BertModel, BertTokenizer
 
 
 def set_seed(seed):
@@ -52,14 +54,10 @@ def process_text(text):
     # 句読点をスペースに変換
     text = re.sub(r"[^\w\s':]", ' ', text)
 
-    # 句読点をスペースに変換
-    text = re.sub(r'\s+,', ',', text)
-
     # 連続するスペースを1つに変換
     text = re.sub(r'\s+', ' ', text).strip()
 
     return text
-
 
 # 1. データローダーの作成
 class VQADataset(torch.utils.data.Dataset):
@@ -76,6 +74,13 @@ class VQADataset(torch.utils.data.Dataset):
         self.idx2answer = {}
 
         # 質問文に含まれる単語を辞書に追加
+        self.build_vocab()
+
+        if self.answer:
+            # 回答に含まれる単語を辞書に追加
+            self.build_answer_vocab()
+
+    def build_vocab(self):
         for question in self.df["question"]:
             question = process_text(question)
             words = question.split(" ")
@@ -84,15 +89,14 @@ class VQADataset(torch.utils.data.Dataset):
                     self.question2idx[word] = len(self.question2idx)
         self.idx2question = {v: k for k, v in self.question2idx.items()}  # 逆変換用の辞書(question)
 
-        if self.answer:
-            # 回答に含まれる単語を辞書に追加
-            for answers in self.df["answers"]:
-                for answer in answers:
-                    word = answer["answer"]
-                    word = process_text(word)
-                    if word not in self.answer2idx:
-                        self.answer2idx[word] = len(self.answer2idx)
-            self.idx2answer = {v: k for k, v in self.answer2idx.items()}  # 逆変換用の辞書(answer)
+    def build_answer_vocab(self):
+        for answers in self.df["answers"]:
+            for answer in answers:
+                word = answer["answer"]
+                word = process_text(word)
+                if word not in self.answer2idx:
+                    self.answer2idx[word] = len(self.answer2idx)
+        self.idx2answer = {v: k for k, v in self.answer2idx.items()}  # 逆変換用の辞書(answer)
 
     def update_dict(self, dataset):
         """
@@ -109,27 +113,16 @@ class VQADataset(torch.utils.data.Dataset):
         self.idx2answer = dataset.idx2answer
 
     def __getitem__(self, idx):
-        """
-        対応するidxのデータ（画像，質問，回答）を取得．
-
-        Parameters
-        ----------
-        idx : int
-            取得するデータのインデックス
-
-        Returns
-        -------
-        image : torch.Tensor  (C, H, W)
-            画像データ
-        question : torch.Tensor  (vocab_size)
-            質問文をone-hot表現に変換したもの
-        answers : torch.Tensor  (n_answer)
-            10人の回答者の回答のid
-        mode_answer_idx : torch.Tensor  (1)
-            10人の回答者の回答の中で最頻値の回答のid
-        """
         image = Image.open(f"{self.image_dir}/{self.df['image'][idx]}")
         image = self.transform(image)
+        question = self.process_question(idx)
+        if self.answer:
+            answers, mode_answer_idx = self.process_answers(idx)
+            return image, question, answers, mode_answer_idx
+        else:
+            return image, question
+
+    def process_question(self, idx):
         question = np.zeros(len(self.idx2question) + 1)  # 未知語用の要素を追加
         question_words = self.df["question"][idx].split(" ")
         for word in question_words:
@@ -137,19 +130,15 @@ class VQADataset(torch.utils.data.Dataset):
                 question[self.question2idx[word]] = 1  # one-hot表現に変換
             except KeyError:
                 question[-1] = 1  # 未知語
+        return torch.Tensor(question)
 
-        if self.answer:
-            answers = [self.answer2idx[process_text(answer["answer"])] for answer in self.df["answers"][idx]]
-            mode_answer_idx = mode(answers)  # 最頻値を取得（正解ラベル）
-
-            return image, torch.Tensor(question), torch.Tensor(answers), int(mode_answer_idx)
-
-        else:
-            return image, torch.Tensor(question)
+    def process_answers(self, idx):
+        answers = [self.answer2idx[process_text(answer["answer"])] for answer in self.df["answers"][idx]]
+        mode_answer_idx = mode(answers)  # 最頻値を取得（正解ラベル）
+        return torch.Tensor(answers), int(mode_answer_idx)
 
     def __len__(self):
         return len(self.df)
-
 
 # 2. 評価指標の実装
 # 簡単にするならBCEを利用する
@@ -169,7 +158,6 @@ def VQA_criterion(batch_pred: torch.Tensor, batch_answers: torch.Tensor):
         total_acc += acc / 10
 
     return total_acc / len(batch_pred)
-
 
 # 3. モデルのの実装
 # ResNetを利用できるようにしておく
@@ -201,7 +189,6 @@ class BasicBlock(nn.Module):
         out = self.relu(out)
 
         return out
-
 
 class BottleneckBlock(nn.Module):
     expansion = 4
@@ -287,6 +274,7 @@ def ResNet50():
     return ResNet(BottleneckBlock, [3, 4, 6, 3])
 
 
+
 class VQAModel(nn.Module):
     def __init__(self, vocab_size: int, n_answer: int):
         super().__init__()
@@ -368,24 +356,32 @@ def main():
         transforms.Resize((224, 224)),
         transforms.ToTensor()
     ])
-    train_dataset = VQADataset(df_path="./data/train.json", image_dir="./data/train", transform=transform)
-    test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=transform, answer=False)
+    train_dataset = VQADataset(df_path="drive/MyDrive/Colab_Notebooks/DLBasics2023_colab/Last/data/train.json", image_dir="drive/MyDrive/Colab Notebooks/DLBasics2023_colab/Last/data/train", transform=transform)
+    test_dataset = VQADataset(df_path="drive/MyDrive/Colab_Notebooks/DLBasics2023_colab/Last/data/valid.json", image_dir="drive/MyDrive/Colab Notebooks/DLBasics2023_colab/Last/data/valid", transform=transform, answer=False)
     test_dataset.update_dict(train_dataset)
+    print("a")
 
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True)
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True, num_workers=4)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False)
 
-    model = VQAModel(vocab_size=len(train_dataset.question2idx)+1, n_answer=len(train_dataset.answer2idx)).to(device)
+    #model = VQAModel(vocab_size=len(train_dataset.question2idx)+1, n_answer=len(train_dataset.answer2idx)).to(device)
+    model = VQAModel(vocab_size=len(train_dataset.question2idx) + 1, n_answer=len(train_dataset.answer2idx)).to(device)
+
 
     # optimizer / criterion
-    num_epoch = 20
+    num_epoch = 5
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
-
+    
+    # Scheduler
+    scheduler = StepLR(optimizer, step_size=5, gamma=0.1)
+    torch.backends.cudnn.benchmark = True
     # train model
     for epoch in range(num_epoch):
-        train_loss, train_acc, train_simple_acc, train_time = train(model, train_loader, optimizer, criterion, device)
-        print(f"【{epoch + 1}/{num_epoch}】\n"
+      scheduler.step()  # スケジューラを呼び出して学習率を更新する
+      train_loss, train_acc, train_simple_acc, train_time = train(model, train_loader, optimizer, criterion, device)
+
+      print(f"【{epoch + 1}/{num_epoch}】\n"
               f"train time: {train_time:.2f} [s]\n"
               f"train loss: {train_loss:.4f}\n"
               f"train acc: {train_acc:.4f}\n"
@@ -403,7 +399,7 @@ def main():
     submission = [train_dataset.idx2answer[id] for id in submission]
     submission = np.array(submission)
     torch.save(model.state_dict(), "model.pth")
-    np.save("submission.npy", submission)
+    np.save("Last_submission.npy", submission)
 
 if __name__ == "__main__":
     main()
